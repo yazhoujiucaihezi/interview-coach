@@ -773,7 +773,8 @@ function readFile(file){
 function aiReady(){ const s=state.settings; return !!(s.base&&s.key&&s.model); }
 const docKey = d => d ? (d.raw.length+":"+d.raw.slice(0,80)) : "";
 
-function buildGenPrompt(doc){
+function buildGenPrompt(doc,count){
+  const n=count||12;
   const raw=doc.raw;
   const excerpt = raw.length>6800 ? raw.slice(0,4600)+"\n\n……（中间省略）……\n\n"+raw.slice(-1900) : raw;
   const hint = {dialogue:"这是一份真实的面试记录", resume:"这是一份简历",
@@ -785,11 +786,11 @@ function buildGenPrompt(doc){
 1. 每一道题都必须锚定材料里真实出现的东西——具体技术名、模块名、数字、或某句原话。绝对禁止「自我介绍」「你最大的优点」「哪个项目更难」「项目你负责哪部分」这类通用题。
 2. 题面必须具体到能直接开口答。反例：「讲讲你的项目」。正例：「你说热榜用 ZSet 存 postId→分数，7 天以外的成员怎么清理，为什么不用定时扫表」。
 3. 三档分布：basic 核对事实、deep 问实现与取舍、edge 问边界与故障。deep + edge 至少占三分之二。
-4. points 给 3-4 条答题要点，是要能直接说出口的关键词句，不要写「要全面」「要深入」这种空话。
+4. points 给 2-3 条答题要点，每条不超过 20 字，是要能直接说出口的关键词句，不要写「要全面」「要深入」这种空话。
 5. quote 必须是材料原文里的片段，不超过 40 字，用来定位这道题从哪来。
 6. 不要编造材料里没有的技术。材料没写清楚的，就出成「这块你打算怎么补」这类。
 
-只输出 JSON，不要 markdown 代码块。`},
+输出必须是单行合法的 JSON：不要 markdown 代码块，不要注释，不要在字符串里换行，字段之间不要有多余文字。内容写简短，宁可少写也不要超长。`},
     {role:"user", content:`【材料】
 """
 ${excerpt}
@@ -803,7 +804,7 @@ ${excerpt}
     {"q": "题面", "why": "面试官问这个想考察什么，20 字内", "points": ["要点1","要点2","要点3"], "quote": "原文片段", "level": "basic|deep|edge"}
   ]
 }
-出 14 道题，覆盖材料里不同的技术点，不要反复问同一个模块。`}
+出 ${n} 道题，覆盖材料里不同的技术点，不要反复问同一个模块。`}
   ];
 }
 
@@ -831,33 +832,68 @@ async function generateWithAI(){
   if(!state.doc) return;
   if(!aiReady()){ toast("先在设置里接入模型，才能按内容出题"); state.view="settings"; render(); return; }
 
-  state.ai={status:"loading",error:"",summary:"",advice:[]};
+  state.ai={status:"loading",error:"",summary:"",advice:[],note:""};
   state.view="overview"; state.practice=null;
   render();
 
-  try{
-    const r=await callModel(buildGenPrompt(state.doc),{temp:0.45,maxTokens:2800});
-    const list=Array.isArray(r.questions)?r.questions:[];
-    const qs=list.map((x,i)=>({
+  const toQs = list => list
+    .filter(x=>x&&typeof x==="object")
+    .map((x,i)=>({
       id:"ai"+i+"_"+Date.now().toString(36),
-      title:String(x.q||"").trim(),
-      intent:String(x.why||"AI 生成"),
+      title:String(x.q||x.question||"").trim(),
+      intent:String(x.why||x.intent||"AI 生成"),
       points:(Array.isArray(x.points)?x.points:[]).map(String).filter(Boolean).slice(0,5),
-      src:String(x.quote||""),
+      src:String(x.quote||x.src||""),
       ref:"",
       level:["basic","deep","edge"].indexOf(x.level)>=0?x.level:"deep",
       followups:[], rubric:[], pitfalls:[], hint:"", follow:false, ai:true
-    })).filter(q=>q.title.length>=6);
+    }))
+    .filter(q=>q.title.length>=6);
 
-    if(qs.length<3) throw new Error("模型只给了 "+qs.length+" 道题，换个模型或再试一次");
+  try{
+    // 第一轮：12 题、4000 token，给足输出空间
+    let text=await callModel(buildGenPrompt(state.doc,12),{temp:0.4,maxTokens:4000,raw:true});
+    let data=null, salvaged=0;
+
+    try{ data=parseJSON(text); }
+    catch(e){
+      const part=salvageQuestions(text);
+      if(part){
+        data={questions:part, summary:salvageField(text,"summary"), advice:[]};
+        salvaged=part.length;
+      }
+    }
+
+    // 第一轮彻底没救（比如输出被砍在第一个题里）：自动重试一次，只要 8 题
+    if(!data){
+      text=await callModel(buildGenPrompt(state.doc,8),{temp:0.3,maxTokens:4000,raw:true});
+      try{ data=parseJSON(text); }
+      catch(e2){
+        const part=salvageQuestions(text);
+        if(part){ data={questions:part,summary:salvageField(text,"summary"),advice:[]}; salvaged=part.length; }
+      }
+    }
+
+    if(!data) throw new Error("模型两次都没能给出可解析的 JSON。建议换 deepseek-chat 或 glm-4-flash 再试。");
+
+    if(Array.isArray(data)) data={questions:data};
+    const qs=toQs(Array.isArray(data.questions)?data.questions:[]);
+    if(qs.length<3) throw new Error("模型只返回了 "+qs.length+" 道有效题目，可能是输出被截断。再点一次「重新生成」即可。");
 
     state.questions=qs;
-    state.ai={status:"done",error:"",summary:String(r.summary||""),
-      advice:(Array.isArray(r.advice)?r.advice:[]).map(String).filter(Boolean).slice(0,6)};
+    state.ai={
+      status:"done", error:"",
+      summary:String(data.summary||""),
+      advice:(Array.isArray(data.advice)?data.advice:[]).map(String).filter(Boolean).slice(0,6),
+      note: salvaged
+        ? (truncated(text) ? "输出被截断，已保留完整的 "+qs.length+" 道"
+                           : "输出格式不规范，已提取 "+qs.length+" 道")
+        : ""
+    };
     saveAI();
-    toast("已按材料生成 "+qs.length+" 道题");
+    toast(salvaged ? "输出被截断，已保留 "+qs.length+" 道题" : "已按材料生成 "+qs.length+" 道题");
   }catch(e){
-    state.ai={status:"error",error:e.message||"出题失败",summary:"",advice:[]};
+    state.ai={status:"error",error:e.message||"出题失败",summary:"",advice:[],note:""};
     toast(e.message||"出题失败");
   }
   render();
@@ -1129,7 +1165,7 @@ function viewOverview(){
       <div class="row" style="gap:12px">
         <div class="pulse" style="width:22px;height:22px;margin:0;border-width:2px"></div>
         <div><b style="font-size:13.5px">模型正在读这份材料并出题</b>
-        <div class="tiny muted">按材料里的具体技术点出，大约 10–30 秒</div></div>
+        <div class="tiny muted">按材料里的具体技术点出 · 约 10–40 秒 · 输出较长时较慢</div></div>
       </div></div>`;
     if(a.status==="error") return `<div class="card pad" style="margin-bottom:16px;border-left:3px solid var(--red)">
       <b style="font-size:13.5px">出题失败</b>
@@ -1138,7 +1174,7 @@ function viewOverview(){
     if(a.status==="done") return `<div class="card pad" style="margin-bottom:16px;border-left:3px solid var(--green)">
       <div class="row" style="flex-wrap:wrap;gap:9px">
         <b style="font-size:13.5px">已按材料生成 ${qs.length} 道题</b>
-        <span class="tiny muted">basic / deep / edge 三档</span>
+        <span class="tiny muted">${esc(a.note||"basic / deep / edge 三档")}</span>
         <span class="grow"></span>
         <button class="btn sm ghost" data-gen="1">重新生成</button>
         <button class="btn sm ghost" id="expq">导出题单</button>
@@ -2044,8 +2080,18 @@ async function callModel(messages,opts={}){
   }
   clearTimeout(timer);
   if(!res.ok){ const t=await res.text(); throw new Error(apiErr(t,res.status)); }
-  const data=await res.json();
-  return parseJSON(data?.choices?.[0]?.message?.content||"");
+  const txt=await res.text();
+  let data;
+  try{ data=JSON.parse(txt); }
+  catch(e){
+    throw new Error("接口返回的不是 JSON，可能被网关或代理改写。响应前 120 字："+txt.slice(0,120).replace(/\s+/g," "));
+  }
+  const msg=data?.choices?.[0]?.message||{};
+  let content=msg.content;
+  if((content==null||content==="")&&msg.reasoning_content) content=msg.reasoning_content;
+  content=content==null?"":String(content);
+  if(opts.raw) return content;
+  return parseJSON(content);
 }
 
 function apiErr(text,status){
@@ -2058,12 +2104,149 @@ function apiErr(text,status){
   return `调用失败（${status}）：${msg}`;
 }
 
+/* =========================================================
+   JSON 解析：容错到「模型输出很脏」也能拿到数据
+   ========================================================= */
+
+/* 从任意文本里截出第一个完整的 JSON 结构；截断时返回剩余部分 */
+function extractJSON(s){
+  const i=s.search(/[{[]/);
+  if(i<0) return "";
+  const open=s[i], close=open==="{"?"}":"]";
+  let depth=0, inStr=false, esc=false;
+  for(let k=i;k<s.length;k++){
+    const c=s[k];
+    if(esc){ esc=false; continue; }
+    if(inStr){
+      if(c==="\\") esc=true;
+      else if(c==='"') inStr=false;
+      continue;
+    }
+    if(c==='"'){ inStr=true; continue; }
+    if(c===open) depth++;
+    else if(c===close){ depth--; if(depth===0) return s.slice(i,k+1); }
+  }
+  return s.slice(i);
+}
+
+/* 修补常见错误：中文引号、字符串内裸换行、尾逗号、未闭合 */
+function repairJSON(src){
+  let out="", inStr=false, esc=false;
+  for(let i=0;i<src.length;i++){
+    const c=src[i];
+    if(inStr){
+      if(esc){ out+=c; esc=false; continue; }
+      if(c==="\\"){ out+=c; esc=true; continue; }
+      if(c==='"'){ out+=c; inStr=false; continue; }
+      if(c==="\u201d"){
+        const rest=src.slice(i+1);
+        if(/^\s*[:,}\]}]/.test(rest)){ out+='"'; inStr=false; continue; }
+      }
+      if(c==="\n"){ out+="\\n"; continue; }
+      if(c==="\r"){ out+="\\r"; continue; }
+      if(c==="\t"){ out+="\\t"; continue; }
+      out+=c; continue;
+    }
+    if(c==='"'){ inStr=true; out+=c; continue; }
+    if(c==="\u201c"){ inStr=true; out+='"'; continue; }   // 中文左引号当结构引号
+    out+=c;
+  }
+  if(inStr) out+='"';
+  out=out.replace(/,(\s*[}\]])/g,"$1");
+
+  // 补全括号
+  let d1=0,d2=0,inS=false,es=false;
+  for(let i=0;i<out.length;i++){
+    const c=out[i];
+    if(es){ es=false; continue; }
+    if(inS){
+      if(c==="\\") es=true;
+      else if(c==='"') inS=false;
+      continue;
+    }
+    if(c==='"'){ inS=true; continue; }
+    if(c==="{") d1++;
+    else if(c==="}") d1--;
+    else if(c==="[") d2++;
+    else if(c==="]") d2--;
+  }
+  if(d1>0||d2>0) out += "]".repeat(Math.max(0,d2)) + "}".repeat(Math.max(0,d1));
+  return out;
+}
+
 function parseJSON(text){
-  let s=String(text).trim().replace(/^```(?:json)?\s*/i,"").replace(/```\s*$/,"").trim();
-  const a=s.indexOf("{"), b=s.lastIndexOf("}");
-  if(a>=0&&b>a) s=s.slice(a,b+1);
-  try{ return JSON.parse(s); }
-  catch(e){ throw new Error("模型返回的不是合法 JSON，再试一次。"); }
+  const raw=String(text==null?"":text).replace(/^\uFEFF/,"").trim();
+  if(!raw) throw new Error("模型返回了空内容。可能是触发了内容过滤，或者这个模型不支持 JSON 模式。");
+
+  const cands=[];
+  const fenced=[...raw.matchAll(/```(?:json|JSON)?\s*([\s\S]*?)```/g)].map(m=>m[1].trim()).filter(Boolean);
+  fenced.forEach(f=>cands.push(f));
+  cands.push(raw);
+
+  // 一轮：原文或围栏内直接解析
+  for(const c of cands){
+    const ex=extractJSON(c);
+    for(const t of ex?[ex,c]:[c]){
+      try{ return JSON.parse(t); }catch(e){}
+    }
+  }
+  // 二轮：修补后再试
+  for(const c of cands){
+    const ex=extractJSON(c);
+    for(const t of ex?[ex,c]:[c]){
+      try{ return JSON.parse(repairJSON(t)); }catch(e){}
+    }
+  }
+  const head=raw.slice(0,90).replace(/\s+/g," ");
+  throw new Error("模型输出不是合法 JSON（开头："+head+"…）。再点一次通常就好了；反复出现请换 deepseek-chat 这类输出稳定的模型。");
+}
+
+/* 输出被截断时，逐个抢救已经完整的题目对象 */
+function salvageQuestions(text){
+  const s=String(text||"");
+  const i=s.indexOf('"questions"');
+  if(i<0) return null;
+  const b=s.indexOf("[",i);
+  if(b<0) return null;
+  const items=[];
+  let k=b+1;
+  while(k<s.length){
+    while(k<s.length && s[k]!=="{") k++;
+    if(k>=s.length) break;
+    let depth=0,inStr=false,esc=false,start=k,closed=-1;
+    for(;k<s.length;k++){
+      const c=s[k];
+      if(esc){ esc=false; continue; }
+      if(inStr){
+        if(c==="\\") esc=true;
+        else if(c==='"') inStr=false;
+        continue;
+      }
+      if(c==='"'){ inStr=true; continue; }
+      if(c==="{") depth++;
+      else if(c==="}"){ depth--; if(depth===0){ closed=k; break; } }
+    }
+    if(closed<0) break;
+    const chunk=s.slice(start,closed+1);
+    let obj=null;
+    try{ obj=JSON.parse(chunk); }
+    catch(e){ try{ obj=JSON.parse(repairJSON(chunk)); }catch(_){} }
+    if(obj&&(obj.q||obj.question)) items.push(obj);
+    k=closed+1;
+  }
+  return items.length?items:null;
+}
+
+/* 判断输出是不是被截断（结尾不是闭合括号） */
+function truncated(text){
+  const t=String(text||"").trim().replace(/```\s*$/,"").trim();
+  return t.length>0 && !/[}\]]$/.test(t);
+}
+
+function salvageField(text,key){
+  const m=String(text||"").match(new RegExp('"'+key+'"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"'));
+  if(!m) return "";
+  try{ return JSON.parse('"'+m[1]+'"'); }catch(e){ return m[1]; }
 }
 
 function localScore(q,answer){
